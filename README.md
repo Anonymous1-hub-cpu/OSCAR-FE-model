@@ -26,6 +26,4 @@ based on multi-domain NLS switching dynamics including:
 If you use this model, please cite:
 Will be added later
 
-## License
-
-MIT License
+IT License
