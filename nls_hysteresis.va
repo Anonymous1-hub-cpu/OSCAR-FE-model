@@ -1,0 +1,205 @@
+// ===============================================================
+// OSCAR-FE: Open-Source Physics-Based FeCAP Verilog-A Model
+// Multi-domain NLS switching with leakage, variation, temperature
+// Compatible with Spectre / SPICE simulators supporting Verilog-A
+// ===============================================================
+
+`include "constants.vams"
+`include "disciplines.vams"
+
+module nls_hysteresis (vin, vout);
+
+    inout vin, vout;
+    electrical vin, vout;
+
+    // ===========================================================
+    // Physical Parameters (Modify According to Design)
+    // ===========================================================
+
+    parameter real width  = 5u  from (0:inf);
+    parameter real length = 2u  from (0:inf);
+    parameter real tfe    = 10n from (0:inf);  // Ferroelectric thickness
+
+    parameter real epiv  = 8.854e-12 from (0:inf); // Vacuum permittivity
+    parameter real epife = 50        from (0:inf); // Relative permittivity
+
+    parameter real Pr = 15 from (0:inf); // Remnant polarization (uC/cm^2)
+
+    // ===========================================================
+    // Activation Energy Distribution (Pearson Type IV)
+    // ===========================================================
+
+    parameter real a = 7;
+    parameter real b = 3;
+    parameter real p = 0.531;
+    parameter real q = 0.7315;
+
+    parameter real vfb = 0.5 from [0:inf);  // Offset variation
+
+    // ===========================================================
+    // NLS Model Parameters
+    // ===========================================================
+
+    parameter real tauo  = 3.87e-7 from (0:inf);
+    parameter real alpha = 4.11;
+    parameter real beta  = 2.07;
+
+    parameter integer n = 2000 from (1:inf);
+
+    parameter real tlimit    = 1e9;
+    parameter real dt_target = 1e-9;
+
+    // ===========================================================
+    // Poole-Frenkel Leakage Parameters
+    // ===========================================================
+
+    parameter real C_pf  = 3.39e-7;
+    parameter real phi_b = 0.3;
+    parameter real K_BOLTZ_val = 1.380649e-23;
+    parameter real T0    = 300.15;
+    parameter real T_sim = 300.15;
+    parameter real q_val = 1.602176634e-19;
+
+    // ===========================================================
+    // Internal Variables
+    // ===========================================================
+
+    real vfe, vpre, time_pre;
+    real p_now, q_now;
+    real pol_total, prob_switch;
+    real local_dt;
+
+    real Ec[n], Ec_r[n], Ec_max[n];
+    real history[n], history_prev[n];
+    real p_state[n], srand[n];
+    real n_tau[n];
+
+    real Ec_pdf[n], Ec_offset[n];
+    real f_distr[10000], l[10000];
+
+    real E_fe, J_pf, I_leak;
+    real kb_T, eps_fe, T_s;
+
+    integer i, j, m, flag, seed;
+    real k, coercive_v, E;
+
+    // ===========================================================
+    // Gamma Function Approximation
+    // ===========================================================
+
+    analog function real gamma_function;
+        input x;
+        real x, fact, c[0:19], accm;
+        integer i;
+        begin
+            fact = 1.0;
+            c[0] = sqrt(2.0 * `M_PI);
+
+            for (i = 1; i < 20; i = i + 1) begin
+                c[i] = exp(20-i) * pow(20-i, i-0.5) / fact;
+                fact = -fact * i;
+            end
+
+            accm = c[0];
+            for (i = 0; i < 20; i = i + 1)
+                accm = accm + c[i] / (x + i);
+
+            accm = accm * exp(-(x+20)) * pow(x+20, x+0.5);
+            gamma_function = accm/x;
+        end
+    endfunction
+
+    analog function real beta_function;
+        input x, y;
+        begin
+            beta_function = gamma_function(x) *
+                            gamma_function(y) /
+                            gamma_function(x + y);
+        end
+    endfunction
+
+    // ===========================================================
+    // Analog Block
+    // ===========================================================
+
+    analog begin
+
+        @(initial_step) begin
+            seed     = 20;
+            vpre     = 0;
+            time_pre = $abstime;
+            T_s      = T0 / T_sim;
+
+            // Domain initialization
+            for (i = 0; i < n; i = i + 1) begin
+                coercive_v   = i * 8.0 / n;
+                Ec_pdf[i]    = (a/b) * pow(coercive_v/b, a*p-1) /
+                               beta_function(p,q) /
+                               pow(1 + pow(coercive_v/b,a), p+q);
+
+                Ec_offset[i] = $rdist_normal(seed, 0, vfb);
+                p_state[i]   = ($random(seed)%2) ? 1 : -1;
+                history[i]   = 0;
+                history_prev[i] = 0;
+            end
+        end
+
+        // Voltage across FeCAP
+        vfe = V(vin, vout);
+        local_dt = $abstime - time_pre;
+        if (local_dt < 1e-20) local_dt = dt_target;
+
+        pol_total = 0;
+
+        // Domain Switching Loop
+        for (i = 0; i < n; i = i + 1) begin
+
+            Ec[i] = (vfe + vpre)/2.0 - Ec_offset[i];
+
+            n_tau[i] = tauo *
+                       exp(pow(Ec_r[i] /
+                           max(abs(Ec[i]), 1e-6), alpha) * T_s);
+
+            if (Ec[i] * p_state[i] <= 0)
+                history[i] = history_prev[i] + local_dt/n_tau[i];
+            else
+                history[i] = history_prev[i] - local_dt/n_tau[i];
+
+            if (history[i] < 0) history[i] = 0;
+
+            prob_switch =
+                1.0 - exp(pow(history_prev[i], beta) -
+                          pow(history[i], beta));
+
+            srand[i] = $rdist_uniform(seed, 0, 1);
+
+            if (prob_switch > srand[i])
+                p_state[i] = -p_state[i];
+
+            history_prev[i] = history[i];
+            pol_total += p_state[i];
+        end
+
+        // Polarization & Leakage
+        p_now  = (Pr * pol_total)/n + epife*epiv*vfe/tfe;
+        q_now  = width * length * p_now;
+
+        kb_T   = K_BOLTZ_val * T_sim;
+        eps_fe = epife * epiv;
+        E_fe   = vfe / tfe;
+
+        J_pf = C_pf * abs(E_fe) *
+               exp((-q_val*phi_b)/kb_T +
+               sqrt(pow(q_val,3)*abs(E_fe) /
+               (`M_PI*eps_fe))/kb_T);
+
+        I_leak = J_pf * width * length;
+
+        I(vin, vout) <+ ddt(q_now) - I_leak;
+
+        vpre     = vfe;
+        time_pre = $abstime;
+
+    end
+
+endmodule
